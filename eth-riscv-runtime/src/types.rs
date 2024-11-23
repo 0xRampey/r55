@@ -9,7 +9,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 /// Implements a Solidity-like Mapping type.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct Mapping<K, V> {
     id: u64,
     pd: PhantomData<(K, V)>,
