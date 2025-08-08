@@ -1,0 +1,308 @@
+# R55 Architecture Documentation
+
+## Overview
+
+R55 is an experimental Ethereum Execution Environment that enables RISC-V smart contracts to run alongside traditional EVM contracts on the same Ethereum state. Here's the comprehensive architecture breakdown:
+
+## Core Components
+
+### 1. Execution Engine (`r55/`)
+- **Main Library**: Integrates with `revm` (Ethereum Virtual Machine implementation)
+- **Execution Layer** (`exec.rs`): Handles contract deployment and transaction execution for both EVM and RISC-V contracts
+- **Gas Metering** (`gas.rs`): Manages gas costs for RISC-V operations
+- **Error Handling** (`error.rs`): Unified error management system
+
+### 2. RISC-V Runtime (`eth-riscv-runtime/`)
+- **Core Runtime** (`lib.rs`): No-std runtime environment with syscall implementations
+- **Storage System** (`types/`): Ethereum-compatible storage primitives (`Slot`, `Mapping`)
+- **Ethereum Bindings**: Direct integration with Ethereum state (storage, logs, calls)
+- **Memory Management** (`alloc.rs`): Custom allocator for RISC-V environment
+
+### 3. RISC-V Interpreter (`eth-riscv-interpreter/`)
+- **ELF Loader**: Loads and executes RISC-V ELF binaries
+- **Emulator Integration**: Uses `rvemu` RISC-V emulator for instruction execution
+- **Memory Layout**: Manages program memory and call data
+
+### 4. Syscall Interface (`eth-riscv-syscalls/`)
+- **Syscall Definitions**: Bridge between RISC-V and Ethereum operations
+- **Host Functions**: Storage reads/writes, Keccak256, caller information, etc.
+
+### 5. Smart Contract Framework
+- **Contract Derive Macros** (`contract-derive/`): Procedural macros for contract development
+- **Code Generation**: Automatic function dispatchers, ABI encoding/decoding, event emission
+- **Storage Layout**: Automatic Ethereum-compatible storage slot allocation
+
+## Folder Organization & Usage
+
+### Development/Build Tools:
+- `contract-derive/` - Proc macros for `#[contract]`, `#[storage]`, `#[Event]` attributes
+- `r55-compile/` - Compilation pipeline to build Rust contracts into RISC-V ELF binaries
+- `scripts/` - Build automation and feature checking scripts
+
+### Runtime Environment:
+- `eth-riscv-runtime/` - Runtime library linked into contracts (syscalls, storage, events)
+- `eth-riscv-syscalls/` - Syscall interface definitions between RISC-V and Ethereum
+- `eth-riscv-interpreter/` - ELF loader and RISC-V emulator integration
+
+### Execution Engine:
+- `r55/` - Main execution engine that integrates with revm for dual EVM/RISC-V support
+
+### Development Artifacts:
+- `examples/` - Sample contracts (ERC20, ERC721, etc.)
+- `asm-runtime-example/` & `c-runtime-examples/` - Low-level runtime examples
+- `*.x` files - Linker scripts for RISC-V memory layout
+
+## Complete Execution Flow: ERC20 Contract Example
+
+### Phase 1: Contract Development & Compilation
+
+**1. Developer writes contract (`examples/erc20/src/lib.rs`)**
+```rust
+#[storage]
+pub struct ERC20 {
+    balance_of: Mapping<Address, Slot<U256>>,
+    // ... other fields
+}
+
+#[contract]
+impl ERC20 {
+    pub fn transfer(&mut self, to: Address, amount: U256) { /* ... */ }
+}
+```
+
+**2. Proc macros expansion (`contract-derive/`)**
+- `#[storage]` generates storage layout with slot allocation
+- `#[contract]` generates function dispatcher and ABI encoding/decoding
+- Creates both runtime and deployment code versions
+
+**3. Compilation pipeline (`r55-compile/`)**
+- Scans `examples/` directory for R55 contracts
+- Compiles with `deploy` feature to generate init code
+- Links with `eth-riscv-runtime` and RISC-V runtime libraries
+- Produces ELF binary with custom entry point
+
+**Folders touched:** `examples/erc20/` → `contract-derive/` → `eth-riscv-runtime/` → `r55-compile/`
+
+### Phase 2: Contract Deployment
+
+**4. Deployment setup (`r55/src/exec.rs:24`)**
+```rust
+pub fn deploy_contract(db: &mut InMemoryDB, bytecode: Bytes, encoded_args: Option<Vec<u8>>)
+```
+
+**5. Init code preparation:**
+- Detects R55 contract by `0xFF` prefix 
+- Constructs init code: `[0xFF][size][runtime_bytecode][constructor_args]`
+- Uses standard EVM CREATE transaction
+
+**6. ELF loading (`eth-riscv-interpreter/src/lib.rs:6`)**
+```rust
+pub fn setup_from_elf(elf_data: &[u8], call_data: &[u8]) -> Result<Emulator>
+```
+- Parses ELF headers and program sections
+- Loads into RISC-V memory space starting at `DRAM_BASE`
+- Sets up call data at memory address `0x8000_0000`
+
+**Folders touched:** `r55/src/exec.rs` → `eth-riscv-interpreter/`
+
+### Phase 3: Contract Execution
+
+**7. Transaction execution (`r55/src/exec.rs`)**
+- Standard Ethereum transaction to deployed contract address
+- R55 execution engine detects RISC-V contract and routes to interpreter
+
+**8. RISC-V emulation (`eth-riscv-interpreter/`)**
+- Loads ELF binary into `rvemu` RISC-V emulator
+- Executes RISC-V instructions starting from entry point
+- Contract's `main()` function calls the function dispatcher
+
+**9. Function dispatch (generated by `contract-derive/`)**
+- Reads function selector from call data (`msg_data()[0..4]`)
+- Matches selector to contract method (e.g., `transfer`)
+- Decodes ABI parameters from call data
+
+**10. Runtime syscalls (`eth-riscv-runtime/lib.rs`)**
+- Contract calls `sload(key)` for storage reads → syscall to host
+- Contract calls `sstore(key, value)` for storage writes → syscall to host  
+- Contract calls `msg_sender()` → syscall to get caller address
+
+**11. Syscall handling (`r55/src/exec.rs` custom handler)**
+- RISC-V emulator triggers exception on `ecall` instruction
+- R55 handler examines syscall type in register `t0`
+- Routes to appropriate Ethereum operation (storage, logging, etc.)
+
+**12. State updates**
+- Storage changes applied to shared Ethereum state tree
+- Events emitted to transaction logs
+- Gas consumed and tracked
+
+**Example syscall flow for storage read:**
+```
+Contract (RISC-V) -> sload(key) -> ecall instruction -> 
+R55 handler -> Ethereum state -> returns value -> 
+RISC-V registers -> contract continues
+```
+
+**Folders touched:** `r55/src/exec.rs` → `eth-riscv-interpreter/` → `rvemu` (external) → `eth-riscv-runtime/` → `eth-riscv-syscalls/`
+
+## EVM Bridging to R55: Key Integration Points
+
+The EVM integration with R55 happens primarily in `r55/src/exec.rs` through custom revm handlers.
+
+### 1. Custom EVM Handler Registration (`exec.rs:117`)
+
+```rust
+pub fn handle_register<EXT, DB: Database>(handler: &mut EvmHandler<'_, EXT, DB>)
+```
+
+R55 registers custom handlers that intercept revm's execution flow:
+
+**CALL Handler Override (`exec.rs:124`):**
+- Intercepts all contract calls
+- Checks if target is RISC-V contract via `riscv_context(frame)`
+- Creates RISC-V execution context if contract starts with `0xFF`
+
+**CREATE Handler Override (`exec.rs:136`):**
+- Intercepts contract deployments
+- Detects R55 init code format: `[0xFF][size][bytecode][constructor_args]`
+
+**EXECUTE_FRAME Handler Override (`exec.rs:147`):**
+- **Key Decision Point**: Routes execution based on contract type
+- If RISC-V context exists → `execute_riscv()`
+- Otherwise → standard EVM execution
+
+### 2. RISC-V Contract Detection (`exec.rs:84`)
+
+```rust
+fn riscv_context(frame: &Frame) -> Option<RVEmu> {
+    let Some((0xFF, bytecode)) = interpreter.bytecode.split_first() else {
+        return None; // Standard EVM contract
+    };
+    // Setup RISC-V emulator...
+}
+```
+
+**Detection Logic:**
+- Checks first byte of bytecode for `0xFF` magic prefix
+- For CREATE: Parses init code structure `[0xFF][size][bytecode][constructor_args]`
+- For CALL: Uses deployed bytecode directly
+- Returns `None` for EVM contracts, `Some(RVEmu)` for RISC-V
+
+### 3. Syscall Bridge Implementation (`exec.rs:205`)
+
+The core bridging happens in the syscall loop where RISC-V `ecall` instructions are translated to Ethereum operations:
+
+```rust
+match run_result {
+    Err(Exception::EnvironmentCallFromMMode) => {
+        let syscall = Syscall::try_from(emu.cpu.xregs.read(5))?;
+        match syscall {
+            Syscall::SLoad => /* Read Ethereum storage */,
+            Syscall::SStore => /* Write Ethereum storage */,
+            Syscall::Call => /* Inter-contract calls */,
+            Syscall::Log => /* Emit events */,
+            // ... 20+ syscalls bridging RISC-V ↔ Ethereum
+        }
+    }
+}
+```
+
+**Critical Syscalls:**
+- `SLoad/SStore` → Direct Ethereum state access
+- `Call/StaticCall` → Cross-contract communication (EVM ↔ RISC-V)  
+- `Log` → Event emission
+- `Caller/CallValue` → Transaction context
+- `Keccak256` → Cryptographic functions
+
+### 4. Seamless EVM Integration
+
+**Handler Registration (`exec.rs:58, 53`):**
+```rust
+.append_handler_register(handle_register)
+```
+
+Both deployment and execution use the same handler pattern, ensuring:
+- **Zero API Changes**: Standard revm interface maintained
+- **Transparent Routing**: EVM vs RISC-V decided at runtime
+- **Shared State**: Same Ethereum state tree for both execution environments
+- **Gas Compatibility**: RISC-V instruction costs mapped to EVM gas units
+
+### 5. Execution Flow Summary
+
+```
+Transaction → revm → Custom Handler → Detection Logic
+                                           ↓
+                         0xFF prefix? → RISC-V Emulator → Syscalls → Ethereum State
+                              ↓                                      ↑
+                         Standard EVM ←─────────────────────────────┘
+```
+
+## Development Workflow
+
+### 1. Contract Compilation (`r55-compile/`)
+- Compiles Rust contracts to RISC-V ELF binaries
+- Links with runtime and syscall libraries
+- Generates both runtime and initialization bytecode
+
+### 2. Contract Structure
+```rust
+#[storage]
+pub struct Contract {
+    // Automatic slot allocation
+}
+
+#[contract]
+impl Contract {
+    pub fn new() -> Self { /* constructor */ }
+    pub fn method(&self) { /* public methods */ }
+}
+```
+
+## Integration Points
+
+### 1. EVM Compatibility
+- Uses unmodified `revm` with custom handler for RISC-V contracts
+- Seamless transaction processing between EVM and RISC-V contracts
+- ABI-encoded inter-contract communication
+
+### 2. State Management
+- Shared Ethereum state tree between EVM and RISC-V contracts
+- Compatible storage layout with EVM (slots, mappings)
+- Unified gas accounting system
+
+### 3. Deployment Process
+- RISC-V contracts prefixed with `0xFF` identifier
+- Custom initcode format: `[0xFF][size][bytecode][constructor_args]`
+- Standard CREATE/CREATE2 transaction support
+
+## Key Features
+
+- **Pure Rust Development**: Standard Rust toolchain and `no_std` environment
+- **Off-the-shelf Tooling**: Leverage existing Rust ecosystem (testing, linting, etc.)
+- **Performance Optimization**: RISC-V enables different optimization strategies than EVM
+- **Language Diversity**: Opens Ethereum to broader developer community
+
+## Example Applications
+
+The repository includes practical examples in `examples/`:
+- **ERC20**: Standard token implementation in Rust
+- **ERC721**: NFT contract implementation  
+- **EVM Caller**: Cross-contract communication demonstrations
+
+## Complete Data Flow Summary
+
+**Development → Deployment → Execution**
+
+1. **`examples/erc20/`** - Source contract code
+2. **`contract-derive/`** - Macro expansion (storage, dispatcher, ABI)
+3. **`eth-riscv-runtime/`** - Runtime library (syscalls, types)  
+4. **`r55-compile/`** - Rust→RISC-V ELF compilation
+5. **`r55/src/exec.rs`** - Deployment via revm CREATE
+6. **`eth-riscv-interpreter/`** - ELF loading into emulator
+7. **`rvemu`** - RISC-V instruction execution
+8. **`eth-riscv-syscalls/`** - Syscall interface definitions
+9. **`r55/src/exec.rs`** - Syscall handling & Ethereum state integration
+
+The key innovation is that R55 acts as a bridge, allowing RISC-V contracts to seamlessly interact with Ethereum's state and call EVM contracts, while using standard development tools and maintaining gas accounting compatibility.
+
+This architecture enables developers to write Ethereum smart contracts in pure Rust while maintaining full compatibility with existing Ethereum infrastructure and EVM contracts. The system provides a seamless dual execution environment where RISC-V and EVM contracts can interact through standard Ethereum mechanisms.
