@@ -9,7 +9,8 @@ repository.workspace = true
 eth-riscv-interpreter.workspace = true
 eth-riscv-syscalls.workspace = true
 
-revm = { version = "19.4.0", features = ["std"] }
+revm = { version = "18.0.0", features = ["std"] }
+derive_more = { version = "1.0.0", features = ["full"] }
 rvemu = { git = "https://github.com/r55-eth/rvemu.git" }
 
 alloy-core = "0.8.20"
